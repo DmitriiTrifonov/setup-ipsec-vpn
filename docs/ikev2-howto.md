@@ -43,6 +43,8 @@ By default, IKEv2 is automatically set up when running the VPN setup script. If 
 
 #### Auto-import configuration
 
+[**Video:** IKEv2 Auto Import Configuration on Windows 8, 10 and 11 (supporters)](https://ko-fi.com/post/IKEv2-Auto-Import-Configuration-on-Windows-8-10-a-K3K1DQCHW)
+
 **Windows 8, 10 and 11** users can automatically import IKEv2 configuration:
 
 1. Securely transfer the generated `.p12` file to your computer.
