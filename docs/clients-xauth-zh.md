@@ -1,6 +1,6 @@
 # 配置 IPsec/XAuth VPN 客户端
 
-*其他语言版本: [English](clients-xauth.md), [简体中文](clients-xauth-zh.md).*
+*其他语言版本: [English](clients-xauth.md), [中文](clients-xauth-zh.md)。*
 
 **注：** 你也可以使用 [IKEv2](ikev2-howto-zh.md)（推荐）或者 [IPsec/L2TP](clients-zh.md) 模式连接。
 
@@ -16,12 +16,16 @@ IPsec/XAuth 模式也称为 "Cisco IPsec"。该模式通常能够比 IPsec/L2TP 
   * [iOS (iPhone/iPad)](#ios)
   * [Linux](#linux)
 
+> 如果你喜欢这个项目，可以表达你的支持或感谢。
+>
+> <a href="https://ko-fi.com/hwdsl2" target="_blank"><img height="36" width="187" src="images/kofi2.png" border="0" alt="Buy Me a Coffee at ko-fi.com" /></a> &nbsp;<a href="https://coindrop.to/hwdsl2" target="_blank"><img src="images/embed-button.png" height="36" width="145" border="0" alt="Coindrop.to me" /></a>
+
 ## Windows
 
-**注：** 你也可以使用 [IKEv2](ikev2-howto-zh.md)（推荐）或者 [IPsec/L2TP](clients-zh.md) 模式连接。无需安装额外的软件。
+> 你也可以使用 [IKEv2](ikev2-howto-zh.md)（推荐）或者 [IPsec/L2TP](clients-zh.md) 模式连接。无需安装额外的软件。
 
 1. 下载并安装免费的 [Shrew Soft VPN 客户端](https://www.shrew.net/download/vpn)。在安装时请选择 **Standard Edition**。   
-   **注：** 该 VPN 客户端 **不支持** Windows 10。
+   **注：** 该 VPN 客户端 **不支持** Windows 10/11。
 1. 单击开始菜单 -> 所有程序 -> ShrewSoft VPN Client -> VPN Access Manager
 1. 单击工具栏中的 **Add (+)** 按钮。
 1. 在 **Host Name or IP Address** 字段中输入`你的 VPN 服务器 IP`。
@@ -41,6 +45,8 @@ VPN 连接成功后，你会在 VPN Connect 状态窗口中看到 **tunnel enabl
 如果在连接过程中遇到错误，请参见 [故障排除](clients-zh.md#故障排除)。
 
 ## OS X
+
+> 你也可以使用 [IKEv2](ikev2-howto-zh.md)（推荐）或者 [IPsec/L2TP](clients-zh.md) 模式连接。
 
 1. 打开系统偏好设置并转到网络部分。
 1. 在窗口左下角单击 **+** 按钮。
@@ -64,6 +70,8 @@ VPN 连接成功后，你会在 VPN Connect 状态窗口中看到 **tunnel enabl
 
 ## Android
 
+> 你也可以使用 [IKEv2](ikev2-howto-zh.md)（推荐）或者 [IPsec/L2TP](clients-zh.md) 模式连接。Android 12 仅支持 [IKEv2](ikev2-howto-zh.md) 模式。
+
 1. 启动 **设置** 应用程序。
 1. 单击 **网络和互联网**。或者，如果你使用 Android 7 或更早版本，在 **无线和网络** 部分单击 **更多...**。
 1. 单击 **VPN**。
@@ -86,6 +94,8 @@ VPN 连接成功后，会在通知栏显示图标。最后你可以到 [这里](
 
 ## iOS
 
+> 你也可以使用 [IKEv2](ikev2-howto-zh.md)（推荐）或者 [IPsec/L2TP](clients-zh.md) 模式连接。
+
 1. 进入设置 -> 通用 -> VPN。
 1. 单击 **添加VPN配置...**。
 1. 单击 **类型** 。选择 **IPSec** 并返回。
@@ -103,6 +113,8 @@ VPN 连接成功后，会在通知栏显示图标。最后你可以到 [这里](
 如果在连接过程中遇到错误，请参见 [故障排除](clients-zh.md#故障排除)。
 
 ## Linux
+
+> 你也可以使用 [IKEv2](ikev2-howto-zh.md) 模式连接（推荐）。
 
 ### Fedora 和 CentOS
 
@@ -137,7 +149,7 @@ VPN 连接成功后，你可以到 [这里](https://www.ipchicken.com) 检测你
 
 注： 这个协议仅适用于本文档。
 
-版权所有 (C) 2016-2021 [Lin Song](https://github.com/hwdsl2) [![View my profile on LinkedIn](https://static.licdn.com/scds/common/u/img/webpromo/btn_viewmy_160x25.png)](https://www.linkedin.com/in/linsongui)   
+版权所有 (C) 2016-2022 [Lin Song](https://github.com/hwdsl2) [![View my profile on LinkedIn](https://static.licdn.com/scds/common/u/img/webpromo/btn_viewmy_160x25.png)](https://www.linkedin.com/in/linsongui)   
 基于 [Joshua Lund 的工作](https://github.com/StreisandEffect/streisand/blob/6aa6b6b2735dd829ca8c417d72eb2768a89b6639/playbooks/roles/l2tp-ipsec/templates/instructions.md.j2) (版权所有 2014-2016)
 
 本程序为自由软件，在自由软件联盟发布的[ GNU 通用公共许可协议](https://www.gnu.org/licenses/gpl.html)的约束下，你可以对其进行再发布及修改。协议版本为第三版或（随你）更新的版本。

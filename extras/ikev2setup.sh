@@ -1,11 +1,14 @@
 #!/bin/bash
 #
-# Script to set up IKEv2 on Ubuntu, Debian, CentOS/RHEL and Amazon Linux 2
+# Script to set up and manage IKEv2 on Ubuntu, Debian, CentOS/RHEL, Rocky Linux,
+# AlmaLinux, Oracle Linux, Amazon Linux 2 and Alpine Linux
+#
+# DO NOT RUN THIS SCRIPT ON YOUR PC OR MAC!
 #
 # The latest version of this script is available at:
 # https://github.com/hwdsl2/setup-ipsec-vpn
 #
-# Copyright (C) 2020-2021 Lin Song <linsongui@gmail.com>
+# Copyright (C) 2020-2022 Lin Song <linsongui@gmail.com>
 #
 # This work is licensed under the Creative Commons Attribution-ShareAlike 3.0
 # Unported License: http://creativecommons.org/licenses/by-sa/3.0/
@@ -29,19 +32,27 @@ check_dns_name() {
   printf '%s' "$1" | tr -d '\n' | grep -Eq "$FQDN_REGEX"
 }
 
-check_run_as_root() {
+check_root() {
   if [ "$(id -u)" != 0 ]; then
     exiterr "Script must be run as root. Try 'sudo bash $0'"
   fi
 }
 
-check_os_type() {
+check_container() {
+  in_container=0
+  if grep -qs "hwdsl2" /opt/src/run.sh; then
+    in_container=1
+  fi
+}
+
+check_os() {
   os_type=centos
   os_arch=$(uname -m | tr -dc 'A-Za-z0-9_-')
   rh_file="/etc/redhat-release"
   if grep -qs "Red Hat" "$rh_file"; then
     os_type=rhel
   fi
+  [ -f /etc/oracle-release ] && os_type=ol
   if grep -qs "release 7" "$rh_file"; then
     os_ver=7
   elif grep -qs "release 8" "$rh_file"; then
@@ -67,18 +78,56 @@ check_os_type() {
         ;;
       [Aa]lpine)
         os_type=alpine
-        [ "$in_container" != "1" ] && exiterr "This script only supports Alpine Linux in a Docker container."
         ;;
       *)
-        exiterr "This script only supports Ubuntu, Debian, CentOS/RHEL 7/8 and Amazon Linux 2."
+cat 1>&2 <<'EOF'
+Error: This script only supports one of the following OS:
+       Ubuntu, Debian, CentOS/RHEL, Rocky Linux, AlmaLinux,
+       Oracle Linux, Amazon Linux 2 or Alpine Linux
+EOF
+        exit 1
         ;;
     esac
     if [ "$os_type" = "alpine" ]; then
-      os_ver=$(. /etc/os-release && printf '%s' "$VERSION_ID")
+      os_ver=$(. /etc/os-release && printf '%s' "$VERSION_ID" | cut -d '.' -f 1,2)
+      if [ "$os_ver" != "3.15" ] && [ "$os_ver" != "3.16" ]; then
+        exiterr "This script only supports Alpine Linux 3.15/3.16."
+      fi
     else
       os_ver=$(sed 's/\..*//' /etc/debian_version | tr -dc 'A-Za-z0-9')
     fi
   fi
+}
+
+check_libreswan() {
+  ipsec_ver=$(ipsec --version 2>/dev/null)
+  if ( ! grep -qs "hwdsl2 VPN script" /etc/sysctl.conf && ! grep -qs "hwdsl2" /opt/src/run.sh ) \
+    || ! printf '%s' "$ipsec_ver" | grep -qi 'libreswan'; then
+cat 1>&2 <<'EOF'
+Error: Your must first set up the IPsec VPN server before setting up IKEv2.
+       See: https://github.com/hwdsl2/setup-ipsec-vpn
+EOF
+    exit 1
+  fi
+}
+
+check_swan_ver() {
+  swan_ver=$(printf '%s' "$ipsec_ver" | sed -e 's/.*Libreswan U\?//' -e 's/\( (\|\/K\).*//')
+  if ! printf '%s\n%s' "3.23" "$swan_ver" | sort -C -V; then
+cat 1>&2 <<EOF
+Error: Libreswan version '$swan_ver' is not supported.
+       This script requires Libreswan 3.23 or newer.
+       To update Libreswan, run:
+       wget https://get.vpnsetup.net/upg -O vpnup.sh && sudo sh vpnup.sh
+EOF
+    exit 1
+  fi
+}
+
+check_utils_exist() {
+  command -v certutil >/dev/null 2>&1 || exiterr "'certutil' not found. Abort."
+  command -v crlutil >/dev/null 2>&1 || exiterr "'crlutil' not found. Abort."
+  command -v pk12util >/dev/null 2>&1 || exiterr "'pk12util' not found. Abort."
 }
 
 abort_and_exit() {
@@ -99,69 +148,17 @@ confirm_or_abort() {
   esac
 }
 
-get_update_url() {
-  update_url=vpnupgrade
-  if [ "$os_type" = "centos" ] || [ "$os_type" = "rhel" ] || [ "$os_type" = "rocky" ] || [ "$os_type" = "alma" ]; then
-    update_url=vpnupgrade-centos
-  elif [ "$os_type" = "amzn" ]; then
-    update_url=vpnupgrade-amzn
-  fi
-  update_url="https://git.io/$update_url"
-}
-
-check_swan_install() {
-  ipsec_ver=$(ipsec --version 2>/dev/null)
-  swan_ver=$(printf '%s' "$ipsec_ver" | sed -e 's/.*Libreswan U\?//' -e 's/\( (\|\/K\).*//')
-  if ( ! grep -qs "hwdsl2 VPN script" /etc/sysctl.conf && ! grep -qs "hwdsl2" /opt/src/run.sh ) \
-    || ! printf '%s' "$ipsec_ver" | grep -q "Libreswan"; then
-cat 1>&2 <<'EOF'
-Error: Your must first set up the IPsec VPN server before setting up IKEv2.
-       See: https://github.com/hwdsl2/setup-ipsec-vpn
-EOF
-    exit 1
-  fi
-  case $swan_ver in
-    3.2[35679]|3.3[12]|4.*)
-      true
-      ;;
-    *)
-      get_update_url
-cat 1>&2 <<EOF
-Error: Libreswan version '$swan_ver' is not supported.
-       This script requires one of these versions:
-       3.23, 3.25-3.27, 3.29, 3.31-3.32 or 4.x
-       To update Libreswan, run:
-       wget $update_url -O vpnup.sh && sudo sh vpnup.sh
-EOF
-      exit 1
-      ;;
-  esac
-}
-
-check_utils_exist() {
-  command -v certutil >/dev/null 2>&1 || exiterr "'certutil' not found. Abort."
-  command -v crlutil >/dev/null 2>&1 || exiterr "'crlutil' not found. Abort."
-  command -v pk12util >/dev/null 2>&1 || exiterr "'pk12util' not found. Abort."
-}
-
-check_container() {
-  in_container=0
-  if grep -qs "hwdsl2" /opt/src/run.sh; then
-    in_container=1
-  fi
-}
-
 show_header() {
 cat <<'EOF'
 
-IKEv2 Script   Copyright (c) 2020-2021 Lin Song   31 July 2021
+IKEv2 Script   Copyright (c) 2020-2022 Lin Song   10 Jul 2022
 
 EOF
 }
 
 show_usage() {
   if [ -n "$1" ]; then
-    echo "Error: $1" >&2;
+    echo "Error: $1" >&2
   fi
   show_header
 cat 1>&2 <<EOF
@@ -169,107 +166,94 @@ Usage: bash $0 [options]
 
 Options:
   --auto                        run IKEv2 setup in auto mode using default options (for initial setup only)
-  --addclient [client name]     add a new client using default options (after IKEv2 setup)
-  --exportclient [client name]  export configuration for an existing client (after IKEv2 setup)
-  --listclients                 list the names of existing clients (after IKEv2 setup)
-  --revokeclient                Revoke a client certificate (after IKEv2 setup)
+  --addclient [client name]     add a new client using default options
+  --exportclient [client name]  export configuration for an existing client
+  --listclients                 list the names of existing clients
+  --revokeclient [client name]  revoke a client certificate
+  --deleteclient [client name]  delete a client certificate
   --removeikev2                 remove IKEv2 and delete all certificates and keys from the IPsec database
   -h, --help                    show this help message and exit
 
 To customize IKEv2 or client options, run this script without arguments.
-For documentation, see: https://git.io/ikev2
+For documentation, see: https://vpnsetup.net/ikev2
 EOF
   exit 1
 }
 
 check_ikev2_exists() {
-  grep -qs "conn ikev2-cp" /etc/ipsec.conf || [ -f /etc/ipsec.d/ikev2.conf ]
+  grep -qs "conn ikev2-cp" "$IPSEC_CONF" || [ -f "$IKEV2_CONF" ]
 }
 
 check_client_name() {
   ! { [ "${#1}" -gt "64" ] || printf '%s' "$1" | LC_ALL=C grep -q '[^A-Za-z0-9_-]\+' \
-    || case $1 in -*) true;; *) false;; esac; }
+    || case $1 in -*) true ;; *) false ;; esac; }
 }
 
 check_cert_exists() {
-  certutil -L -d sql:/etc/ipsec.d -n "$1" >/dev/null 2>&1
+  certutil -L -d "$CERT_DB" -n "$1" >/dev/null 2>&1
 }
 
 check_cert_exists_and_exit() {
-  if certutil -L -d sql:/etc/ipsec.d -n "$1" >/dev/null 2>&1; then
+  if certutil -L -d "$CERT_DB" -n "$1" >/dev/null 2>&1; then
     echo "Error: Certificate '$1' already exists." >&2
     abort_and_exit
   fi
 }
 
 check_cert_status() {
-  cert_status=$(certutil -V -u C -d sql:/etc/ipsec.d -n "$1")
+  cert_status=$(certutil -V -u C -d "$CERT_DB" -n "$1")
 }
 
 check_arguments() {
-  if [ "$use_defaults" = "1" ]; then
-    if check_ikev2_exists; then
-      echo "Warning: Ignoring parameter '--auto'. Use '-h' for usage information." >&2
+  if [ "$use_defaults" = "1" ] && check_ikev2_exists; then
+    echo "Error: Invalid parameter '--auto'. IKEv2 is already set up on this server." >&2
+    echo "       To manage VPN clients, re-run this script without '--auto'." >&2
+    exit 1
+  fi
+  if [ "$((add_client + export_client + list_clients + revoke_client + delete_client))" -gt 1 ]; then
+    show_usage "Invalid parameters. Specify only one of '--addclient', '--exportclient', '--listclients', '--revokeclient' or '--deleteclient'."
+  fi
+  if [ "$remove_ikev2" = "1" ]; then
+    if [ "$((add_client + export_client + list_clients + revoke_client + delete_client + use_defaults))" -gt 0 ]; then
+      show_usage "Invalid parameters. '--removeikev2' cannot be specified with other parameters."
     fi
   fi
-  if [ "$((add_client + export_client + list_clients + revoke_client))" -gt 1 ]; then
-    show_usage "Invalid parameters. Specify only one of '--addclient', '--exportclient', '--listclients' or '--revokeclient'."
+  if ! check_ikev2_exists; then
+    [ "$add_client" = "1" ] && exiterr "You must first set up IKEv2 before adding a client."
+    [ "$export_client" = "1" ] && exiterr "You must first set up IKEv2 before exporting a client."
+    [ "$list_clients" = "1" ] && exiterr "You must first set up IKEv2 before listing clients."
+    [ "$revoke_client" = "1" ] && exiterr "You must first set up IKEv2 before revoking a client certificate."
+    [ "$delete_client" = "1" ] && exiterr "You must first set up IKEv2 before deleting a client certificate."
+    [ "$remove_ikev2" = "1" ] && exiterr "Cannot remove IKEv2 because it has not been set up on this server."
   fi
   if [ "$add_client" = "1" ]; then
-    check_ikev2_exists || exiterr "You must first set up IKEv2 before adding a client."
     if [ -z "$client_name" ] || ! check_client_name "$client_name"; then
       exiterr "Invalid client name. Use one word only, no special characters except '-' and '_'."
     elif check_cert_exists "$client_name"; then
       exiterr "Invalid client name. Client '$client_name' already exists."
     fi
   fi
-  if [ "$export_client" = "1" ]; then
-    check_ikev2_exists || exiterr "You must first set up IKEv2 before exporting a client."
+  if [ "$export_client" = "1" ] || [ "$revoke_client" = "1" ] || [ "$delete_client" = "1" ]; then
     get_server_address
     if [ -z "$client_name" ] || ! check_client_name "$client_name" \
-      || [ "$client_name" = "IKEv2 VPN CA" ] || [ "$client_name" = "$server_addr" ] \
+      || [ "$client_name" = "$CA_NAME" ] || [ "$client_name" = "$server_addr" ] \
       || ! check_cert_exists "$client_name"; then
       exiterr "Invalid client name, or client does not exist."
     fi
-    if ! check_cert_status "$client_name"; then
+    if [ "$delete_client" = "0" ] && ! check_cert_status "$client_name"; then
       printf '%s' "Error: Certificate '$client_name' " >&2
       if printf '%s' "$cert_status" | grep -q "revoked"; then
-        echo "has been revoked." >&2
+        if [ "$revoke_client" = "1" ]; then
+          echo "has already been revoked." >&2
+        else
+          echo "has been revoked." >&2
+        fi
       elif printf '%s' "$cert_status" | grep -q "expired"; then
         echo "has expired." >&2
       else
         echo "is invalid." >&2
       fi
       exit 1
-    fi
-  fi
-  if [ "$list_clients" = "1" ]; then
-    check_ikev2_exists || exiterr "You must first set up IKEv2 before listing clients."
-  fi
-  if [ "$revoke_client" = "1" ]; then
-    check_ikev2_exists || exiterr "You must first set up IKEv2 before revoking a client certificate."
-    get_server_address
-    if [ -z "$client_name" ] || ! check_client_name "$client_name" \
-      || [ "$client_name" = "IKEv2 VPN CA" ] || [ "$client_name" = "$server_addr" ] \
-      || ! check_cert_exists "$client_name"; then
-      exiterr "Invalid client name, or client does not exist."
-    fi
-    if ! check_cert_status "$client_name"; then
-      printf '%s' "Error: Certificate '$client_name' " >&2
-      if printf '%s' "$cert_status" | grep -q "revoked"; then
-        echo "has already been revoked." >&2
-      elif printf '%s' "$cert_status" | grep -q "expired"; then
-        echo "has expired." >&2
-      else
-        echo "is invalid." >&2
-      fi
-      exit 1
-    fi
-  fi
-  if [ "$remove_ikev2" = "1" ]; then
-    check_ikev2_exists || exiterr "Cannot remove IKEv2 because it has not been set up on this server."
-    if [ "$((add_client + export_client + list_clients + revoke_client + use_defaults))" -gt 0 ]; then
-      show_usage "Invalid parameters. '--removeikev2' cannot be specified with other parameters."
     fi
   fi
 }
@@ -282,70 +266,54 @@ check_server_dns_name() {
 
 check_custom_dns() {
   if { [ -n "$VPN_DNS_SRV1" ] && ! check_ip "$VPN_DNS_SRV1"; } \
-    || { [ -n "$VPN_DNS_SRV2" ] && ! check_ip "$VPN_DNS_SRV2"; } then
+    || { [ -n "$VPN_DNS_SRV2" ] && ! check_ip "$VPN_DNS_SRV2"; }; then
     exiterr "Invalid DNS server(s)."
   fi
 }
 
-check_swan_ver() {
-  if [ "$in_container" = "0" ]; then
-    swan_ver_url="https://dl.ls20.com/v1/$os_type/$os_ver/swanverikev2?arch=$os_arch&ver=$swan_ver&auto=$use_defaults"
+check_and_set_client_name() {
+  if [ -n "$VPN_CLIENT_NAME" ]; then
+    client_name="$VPN_CLIENT_NAME"
+    check_client_name "$client_name" \
+      || exiterr "Invalid client name. Use one word only, no special characters except '-' and '_'."
   else
-    swan_ver_url="https://dl.ls20.com/v1/docker/$os_type/$os_arch/swanverikev2?ver=$swan_ver&auto=$use_defaults"
+    client_name=vpnclient
   fi
-  swan_ver_latest=$(wget -t 3 -T 15 -qO- "$swan_ver_url")
+  check_cert_exists "$client_name" && exiterr "Client '$client_name' already exists."
 }
 
-run_swan_update() {
-  get_update_url
-  TMPDIR=$(mktemp -d /tmp/vpnup.XXX 2>/dev/null)
-  if [ -d "$TMPDIR" ]; then
-    set -x
-    if wget -t 3 -T 30 -q -O "$TMPDIR/vpnup.sh" "$update_url"; then
-      /bin/sh "$TMPDIR/vpnup.sh"
-    fi
-    { set +x; } 2>&-
-    [ ! -s "$TMPDIR/vpnup.sh" ] && echo "Error: Could not download update script." >&2
-    /bin/rm -f "$TMPDIR/vpnup.sh"
-    /bin/rmdir "$TMPDIR"
+set_server_address() {
+  if [ -n "$VPN_DNS_NAME" ]; then
+    use_dns_name=1
+    server_addr="$VPN_DNS_NAME"
   else
-    echo "Error: Could not create temporary directory." >&2
+    use_dns_name=0
+    get_server_ip
+    check_ip "$public_ip" || exiterr "Cannot detect this server's public IP."
+    server_addr="$public_ip"
   fi
-  read -n 1 -s -r -p "Press any key to continue IKEv2 setup..."
-  echo
+  check_cert_exists_and_exit "$server_addr"
 }
 
-select_swan_update() {
-  if printf '%s' "$swan_ver_latest" | grep -Eq '^([3-9]|[1-9][0-9]{1,2})(\.([0-9]|[1-9][0-9]{1,2})){1,2}$' \
-    && [ "$swan_ver" != "$swan_ver_latest" ] \
-    && printf '%s\n%s' "$swan_ver" "$swan_ver_latest" | sort -C -V; then
-    echo "Note: A newer version of Libreswan ($swan_ver_latest) is available."
-    echo "      It is recommended to update Libreswan before setting up IKEv2."
-    if [ "$in_container" = "0" ]; then
-      echo
-      printf "Do you want to update Libreswan? [Y/n] "
-      read -r response
-      case $response in
-        [yY][eE][sS]|[yY]|'')
-          echo
-          run_swan_update
-          ;;
-        *)
-          echo
-          ;;
-      esac
-    else
-      echo "      To update this Docker image, see: https://git.io/updatedockervpn"
-      echo
-      confirm_or_abort "Do you want to continue anyway? [y/N] "
-    fi
+set_dns_servers() {
+  if [ -n "$VPN_DNS_SRV1" ] && [ -n "$VPN_DNS_SRV2" ]; then
+    dns_server_1="$VPN_DNS_SRV1"
+    dns_server_2="$VPN_DNS_SRV2"
+    dns_servers="$VPN_DNS_SRV1 $VPN_DNS_SRV2"
+  elif [ -n "$VPN_DNS_SRV1" ]; then
+    dns_server_1="$VPN_DNS_SRV1"
+    dns_server_2=""
+    dns_servers="$VPN_DNS_SRV1"
+  else
+    dns_server_1=8.8.8.8
+    dns_server_2=8.8.4.4
+    dns_servers="8.8.8.8 8.8.4.4"
   fi
 }
 
 show_welcome() {
 cat <<'EOF'
-Welcome! Use this script to set up IKEv2 after setting up your own IPsec VPN server.
-Alternatively, you may manually set up IKEv2. See: https://git.io/ikev2
+Welcome! Use this script to set up IKEv2 on your VPN server.
 
 I need to ask you a few questions before starting setup.
 You can use the default options and just press enter if you are OK with them.
@@ -354,20 +322,12 @@ EOF
 }
 
 show_start_setup() {
-  if [ -n "$VPN_DNS_NAME" ] || [ -n "$VPN_CLIENT_NAME" ] || [ -n "$VPN_DNS_SRV1" ]; then
-    bigecho "Starting IKEv2 setup in auto mode."
-    printf '%s' "## Using custom option(s): "
-    [ -n "$VPN_DNS_NAME" ] && printf '%s' "VPN_DNS_NAME "
-    [ -n "$VPN_CLIENT_NAME" ] && printf '%s' "VPN_CLIENT_NAME "
-    if [ -n "$VPN_DNS_SRV1" ] && [ -n "$VPN_DNS_SRV2" ]; then
-      printf '%s' "VPN_DNS_SRV1 VPN_DNS_SRV2"
-    elif [ -n "$VPN_DNS_SRV1" ]; then
-      printf '%s' "VPN_DNS_SRV1"
-    fi
-    echo
-  else
-    bigecho "Starting IKEv2 setup in auto mode, using default options."
+  op_text=default
+  if [ -n "$VPN_DNS_NAME" ] || [ -n "$VPN_CLIENT_NAME" ] \
+    || [ -n "$VPN_DNS_SRV1" ] || [ -n "$VPN_PROTECT_CONFIG" ]; then
+    op_text=custom
   fi
+  bigecho "Starting IKEv2 setup in auto mode, using $op_text options."
 }
 
 show_add_client() {
@@ -375,7 +335,7 @@ show_add_client() {
 }
 
 show_export_client() {
-  bigecho "Exporting existing IKEv2 client '$client_name'."
+  bigecho "Exporting IKEv2 client '$client_name'."
 }
 
 get_export_dir() {
@@ -402,18 +362,40 @@ get_server_ip() {
 }
 
 get_server_address() {
-  server_addr=$(grep -s "leftcert=" /etc/ipsec.d/ikev2.conf | cut -f2 -d=)
-  [ -z "$server_addr" ] && server_addr=$(grep -s "leftcert=" /etc/ipsec.conf | cut -f2 -d=)
+  server_addr=$(grep -s "leftcert=" "$IKEV2_CONF" | cut -f2 -d=)
+  [ -z "$server_addr" ] && server_addr=$(grep -s "leftcert=" "$IPSEC_CONF" | cut -f2 -d=)
   check_ip "$server_addr" || check_dns_name "$server_addr" || exiterr "Could not get VPN server address."
 }
 
 list_existing_clients() {
   echo "Checking for existing IKEv2 client(s)..."
-  certutil -L -d sql:/etc/ipsec.d | grep -v -e '^$' -e 'IKEv2 VPN CA' -e '\.' | tail -n +3 | cut -f1 -d ' '
+  echo
+  client_names=$(certutil -L -d "$CERT_DB" | grep -v -e '^$' -e "$CA_NAME" -e '\.' | tail -n +3 | cut -f1 -d ' ')
+  max_len=$(printf '%s\n' "$client_names" | wc -L 2>/dev/null)
+  [[ $max_len =~ ^[0-9]+$ ]] || max_len=64
+  [ "$max_len" -gt "64" ] && max_len=64
+  [ "$max_len" -lt "16" ] && max_len=16
+  printf "%-${max_len}s  %s\n" 'Client Name' 'Certificate Status'
+  printf "%-${max_len}s  %s\n" '------------' '-------------------'
+  if [ -n "$client_names" ]; then
+    printf '%s\n' "$client_names" | LC_ALL=C sort | while read -r line; do
+      printf "%-${max_len}s  " "$line"
+      client_status=$(certutil -V -u C -d "$CERT_DB" -n "$line" | grep -o -e ' valid' -e expired -e revoked | sed -e 's/^ //')
+      [ -z "$client_status" ] && client_status=unknown
+      printf '%s\n' "$client_status"
+    done
+  fi
+  client_count=$(printf '%s\n' "$client_names" | wc -l 2>/dev/null)
+  [ -z "$client_names" ] && client_count=0
+  if [ "$client_count" = "1" ]; then
+    printf '\n%s\n' "Total: 1 client"
+  elif [ -n "$client_count" ]; then
+    printf '\n%s\n' "Total: $client_count clients"
+  fi
 }
 
 enter_server_address() {
-  echo "Do you want IKEv2 VPN clients to connect to this server using a DNS name,"
+  echo "Do you want IKEv2 clients to connect to this server using a DNS name,"
   printf "e.g. vpn.example.com, instead of its IP address? [y/N] "
   read -r response
   case $response in
@@ -448,52 +430,51 @@ enter_server_address() {
 
 enter_client_name() {
   echo
-  echo "Provide a name for the IKEv2 VPN client."
+  echo "Provide a name for the IKEv2 client."
   echo "Use one word only, no special characters except '-' and '_'."
-  read -rp "Client name: " client_name
-  [ -z "$client_name" ] && abort_and_exit
+  if [ "$1" = "with_defaults" ]; then
+    read -rp "Client name: [vpnclient] " client_name
+    [ -z "$client_name" ] && client_name=vpnclient
+  else
+    read -rp "Client name: " client_name
+    [ -z "$client_name" ] && abort_and_exit
+  fi
   while ! check_client_name "$client_name" || check_cert_exists "$client_name"; do
     if ! check_client_name "$client_name"; then
       echo "Invalid client name."
     else
       echo "Invalid client name. Client '$client_name' already exists."
     fi
-    read -rp "Client name: " client_name
-    [ -z "$client_name" ] && abort_and_exit
-  done
-}
-
-enter_client_name_with_defaults() {
-  echo
-  echo "Provide a name for the IKEv2 VPN client."
-  echo "Use one word only, no special characters except '-' and '_'."
-  read -rp "Client name: [vpnclient] " client_name
-  [ -z "$client_name" ] && client_name=vpnclient
-  while ! check_client_name "$client_name" || check_cert_exists "$client_name"; do
-      if ! check_client_name "$client_name"; then
-        echo "Invalid client name."
-      else
-        echo "Invalid client name. Client '$client_name' already exists."
-      fi
-    read -rp "Client name: [vpnclient] " client_name
-    [ -z "$client_name" ] && client_name=vpnclient
+    if [ "$1" = "with_defaults" ]; then
+      read -rp "Client name: [vpnclient] " client_name
+      [ -z "$client_name" ] && client_name=vpnclient
+    else
+      read -rp "Client name: " client_name
+      [ -z "$client_name" ] && abort_and_exit
+    fi
   done
 }
 
 enter_client_name_for() {
   echo
   list_existing_clients
+  if [ "$client_count" = "0" ]; then
+    echo
+    echo "No IKEv2 clients in the IPsec database. Nothing to $1." >&2
+    exit 1
+  fi
   get_server_address
   echo
   read -rp "Enter the name of the IKEv2 client to $1: " client_name
   [ -z "$client_name" ] && abort_and_exit
-  while ! check_client_name "$client_name" || [ "$client_name" = "IKEv2 VPN CA" ] \
+  while ! check_client_name "$client_name" || [ "$client_name" = "$CA_NAME" ] \
     || [ "$client_name" = "$server_addr" ] || ! check_cert_exists "$client_name" \
     || ! check_cert_status "$client_name"; do
-    if ! check_client_name "$client_name" || [ "$client_name" = "IKEv2 VPN CA" ] \
+    if ! check_client_name "$client_name" || [ "$client_name" = "$CA_NAME" ] \
     || [ "$client_name" = "$server_addr" ] || ! check_cert_exists "$client_name"; then
       echo "Invalid client name, or client does not exist."
     else
+      [ "$1" = "delete" ] && break
       printf '%s' "Error: Certificate '$client_name' "
       if printf '%s' "$cert_status" | grep -q "revoked"; then
         if [ "$1" = "revoke" ]; then
@@ -512,7 +493,7 @@ enter_client_name_for() {
   done
 }
 
-enter_client_cert_validity() {
+enter_client_validity() {
   echo
   echo "Specify the validity period (in months) for this client certificate."
   read -rp "Enter a number between 1 and 120: [120] " client_validity
@@ -595,6 +576,9 @@ check_mobike_support() {
   if uname -a | grep -qi qnap; then
     mobike_support=0
   fi
+  if uname -a | grep -qi synology; then
+    mobike_support=0
+  fi
   if [ "$mobike_support" = "1" ]; then
     bigecho2 "Checking for MOBIKE support... available"
   else
@@ -606,11 +590,13 @@ select_mobike() {
   echo
   mobike_enable=0
   if [ "$mobike_support" = "1" ]; then
-    echo
-    echo "The MOBIKE IKEv2 extension allows VPN clients to change network attachment points,"
-    echo "e.g. switch between mobile data and Wi-Fi and keep the IPsec tunnel up on the new IP."
-    echo
-    printf "Do you want to enable MOBIKE support? [Y/n] "
+cat <<'EOF'
+
+The MOBIKE IKEv2 extension allows VPN clients to change network attachment points,
+e.g. switch between mobile data and Wi-Fi and keep the IPsec tunnel up on the new IP.
+
+EOF
+    printf "Enable MOBIKE support? [Y/n] "
     read -r response
     case $response in
       [yY][eE][sS]|[yY]|'')
@@ -623,18 +609,56 @@ select_mobike() {
   fi
 }
 
+check_config_password() {
+  use_config_password=0
+  case $VPN_PROTECT_CONFIG in
+    [yY][eE][sS])
+      use_config_password=1
+      ;;
+    *)
+      if grep -qs '^IKEV2_CONFIG_PASSWORD=.\+' "$CONF_FILE"; then
+        use_config_password=1
+      fi
+      ;;
+  esac
+}
+
+select_config_password() {
+  if [ "$use_config_password" = "0" ]; then
+cat <<'EOF'
+
+IKEv2 client config files contain the client certificate, private key and CA certificate.
+This script can optionally generate a random password to protect these files.
+
+EOF
+    printf "Protect client config files using a password? [y/N] "
+    read -r response
+    case $response in
+      [yY][eE][sS]|[yY])
+        use_config_password=1
+        ;;
+      *)
+        use_config_password=0
+        ;;
+    esac
+  fi
+}
+
 select_menu_option() {
-  echo "IKEv2 is already set up on this server."
-  echo
-  echo "Select an option:"
-  echo "  1) Add a new client"
-  echo "  2) Export configuration for an existing client"
-  echo "  3) List existing clients"
-  echo "  4) Revoke a client certificate"
-  echo "  5) Remove IKEv2"
-  echo "  6) Exit"
+cat <<'EOF'
+IKEv2 is already set up on this server.
+
+Select an option:
+  1) Add a new client
+  2) Export configuration for an existing client
+  3) List existing clients
+  4) Revoke a client certificate
+  5) Delete a client certificate
+  6) Remove IKEv2
+  7) Exit
+EOF
   read -rp "Option: " selected_option
-  until [[ "$selected_option" =~ ^[1-6]$ ]]; do
+  until [[ "$selected_option" =~ ^[1-7]$ ]]; do
     printf '%s\n' "$selected_option: invalid selection."
     read -rp "Option: " selected_option
   done
@@ -652,7 +676,6 @@ confirm_setup_options() {
 cat <<EOF
 
 We are ready to set up IKEv2 now. Below are the setup options you selected.
-Please double check before continuing!
 
 ======================================
 
@@ -672,52 +695,101 @@ EOF
   else
     echo "MOBIKE support: Not available"
   fi
+  if [ "$use_config_password" = "1" ]; then
+    echo "Protect client config: Yes"
+  else
+    echo "Protect client config: No"
+  fi
 cat <<EOF
 DNS server(s): $dns_servers
 
 ======================================
 
 EOF
-  confirm_or_abort "Do you want to continue? [y/N] "
+  printf "Do you want to continue? [Y/n] "
+  read -r response
+  case $response in
+    [yY][eE][sS]|[yY]|'')
+      echo
+      ;;
+    *)
+      abort_and_exit
+      ;;
+  esac
 }
 
 create_client_cert() {
   bigecho2 "Generating client certificate..."
   sleep 1
   certutil -z <(head -c 1024 /dev/urandom) \
-    -S -c "IKEv2 VPN CA" -n "$client_name" \
+    -S -c "$CA_NAME" -n "$client_name" \
     -s "O=IKEv2 VPN,CN=$client_name" \
     -k rsa -g 3072 -v "$client_validity" \
-    -d sql:/etc/ipsec.d -t ",," \
+    -d "$CERT_DB" -t ",," \
     --keyUsage digitalSignature,keyEncipherment \
     --extKeyUsage serverAuth,clientAuth -8 "$client_name" >/dev/null 2>&1 || exiterr "Failed to create client certificate."
 }
 
 create_p12_password() {
-  config_file="/etc/ipsec.d/.vpnconfig"
-  if grep -qs '^IKEV2_CONFIG_PASSWORD=.\+' "$config_file"; then
-    . "$config_file"
-    p12_password="$IKEV2_CONFIG_PASSWORD"
+  p12_password=$(LC_CTYPE=C tr -dc 'A-HJ-NPR-Za-km-z2-9' </dev/urandom 2>/dev/null | head -c 18)
+  [ -z "$p12_password" ] && exiterr "Could not generate a random password for .p12 file."
+}
+
+get_p12_password() {
+  if [ "$use_config_password" = "0" ]; then
+    create_p12_password
   else
-    p12_password=$(LC_CTYPE=C tr -dc 'A-HJ-NPR-Za-km-z2-9' </dev/urandom 2>/dev/null | head -c 18)
-    [ -z "$p12_password" ] && exiterr "Could not generate a random password for .p12 file."
-    mkdir -p /etc/ipsec.d
-    printf '%s\n' "IKEV2_CONFIG_PASSWORD='$p12_password'" >> "$config_file"
-    chmod 600 "$config_file"
+    p12_password=$(grep -s '^IKEV2_CONFIG_PASSWORD=.\+' "$CONF_FILE" | tail -n 1 | cut -f2- -d= | sed -e "s/^'//" -e "s/'$//")
+    if [ -z "$p12_password" ]; then
+      create_p12_password
+      if [ -n "$CONF_FILE" ] && [ -n "$CONF_DIR" ]; then
+        mkdir -p "$CONF_DIR"
+        printf '%s\n' "IKEV2_CONFIG_PASSWORD='$p12_password'" >> "$CONF_FILE"
+        chmod 600 "$CONF_FILE"
+      fi
+    fi
   fi
 }
 
 export_p12_file() {
   bigecho2 "Creating client configuration..."
-  create_p12_password
+  get_p12_password
   p12_file="$export_dir$client_name.p12"
-  pk12util -W "$p12_password" -d sql:/etc/ipsec.d -n "$client_name" -o "$p12_file" >/dev/null || exit 1
-  if [ "$os_type" = "alpine" ]; then
+  p12_file_enc="$export_dir$client_name.enc.p12"
+  pk12util -W "$p12_password" -d "$CERT_DB" -n "$client_name" -o "$p12_file_enc" >/dev/null || exit 1
+  if [ "$os_type" = "alpine" ] || { [ "$os_type" = "ubuntu" ] && [ "$os_ver" = "11" ]; }; then
     pem_file="$export_dir$client_name.temp.pem"
-    openssl pkcs12 -in "$p12_file" -out "$pem_file" -passin "pass:$p12_password" -passout "pass:$p12_password" || exit 1
-    openssl pkcs12 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -export -in "$pem_file" -out "$p12_file" \
+    openssl pkcs12 -in "$p12_file_enc" -out "$pem_file" -passin "pass:$p12_password" -passout "pass:$p12_password" || exit 1
+    openssl pkcs12 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -export -in "$pem_file" -out "$p12_file_enc" \
       -name "$client_name" -passin "pass:$p12_password" -passout "pass:$p12_password" || exit 1
+    if [ "$use_config_password" = "0" ]; then
+      openssl pkcs12 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -export -in "$pem_file" -out "$p12_file" \
+        -name "$client_name" -passin "pass:$p12_password" -passout pass: || exit 1
+    fi
     /bin/rm -f "$pem_file"
+  elif [ "$os_ver" = "bookwormsid" ]; then
+    ca_crt="$export_dir$client_name.ca.crt"
+    client_crt="$export_dir$client_name.client.crt"
+    client_key="$export_dir$client_name.client.key"
+    pem_file="$export_dir$client_name.temp.pem"
+    openssl pkcs12 -in "$p12_file_enc" -passin "pass:$p12_password" -cacerts -nokeys -out "$ca_crt" || exit 1
+    openssl pkcs12 -in "$p12_file_enc" -passin "pass:$p12_password" -clcerts -nokeys -out "$client_crt" || exit 1
+    openssl pkcs12 -in "$p12_file_enc" -passin "pass:$p12_password" -passout "pass:$p12_password" \
+      -nocerts -out "$client_key" || exit 1
+    cat "$client_key" "$client_crt" "$ca_crt" > "$pem_file"
+    /bin/rm -f "$client_key" "$client_crt" "$ca_crt"
+    openssl pkcs12 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -export -in "$pem_file" -out "$p12_file_enc" \
+      -legacy -name "$client_name" -passin "pass:$p12_password" -passout "pass:$p12_password" || exit 1
+    if [ "$use_config_password" = "0" ]; then
+      openssl pkcs12 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -export -in "$pem_file" -out "$p12_file" \
+        -legacy -name "$client_name" -passin "pass:$p12_password" -passout pass: || exit 1
+    fi
+    /bin/rm -f "$pem_file"
+  elif [ "$use_config_password" = "0" ]; then
+    pk12util -W "" -d "$CERT_DB" -n "$client_name" -o "$p12_file" >/dev/null || exit 1
+  fi
+  if [ "$use_config_password" = "1" ]; then
+    /bin/cp -f "$p12_file_enc" "$p12_file"
   fi
   if [ "$export_to_home_dir" = "1" ]; then
     chown "$SUDO_USER:$SUDO_USER" "$p12_file"
@@ -730,7 +802,7 @@ install_base64_uuidgen() {
     bigecho2 "Installing required packages..."
     if [ "$os_type" = "ubuntu" ] || [ "$os_type" = "debian" ] || [ "$os_type" = "raspbian" ]; then
       export DEBIAN_FRONTEND=noninteractive
-      apt-get -yqq update || exiterr "'apt-get update' failed."
+      apt-get -yqq update || apt-get -yqq update || exiterr "'apt-get update' failed."
     fi
   fi
   if ! command -v base64 >/dev/null 2>&1; then
@@ -749,12 +821,21 @@ install_base64_uuidgen() {
   fi
 }
 
+install_uuidgen() {
+  if ! command -v uuidgen >/dev/null 2>&1; then
+    bigecho2 "Installing required packages..."
+    apk add -U -q uuidgen || exiterr "'apk add' failed."
+  fi
+}
+
 create_mobileconfig() {
   [ -z "$server_addr" ] && get_server_address
-  p12_base64=$(base64 -w 52 "$export_dir$client_name.p12")
+  p12_file_enc="$export_dir$client_name.enc.p12"
+  p12_base64=$(base64 -w 52 "$p12_file_enc")
+  /bin/rm -f "$p12_file_enc"
   [ -z "$p12_base64" ] && exiterr "Could not encode .p12 file."
-  ca_base64=$(certutil -L -d sql:/etc/ipsec.d -n "IKEv2 VPN CA" -a | grep -v CERTIFICATE)
-  [ -z "$ca_base64" ] && exiterr "Could not encode IKEv2 VPN CA certificate."
+  ca_base64=$(certutil -L -d "$CERT_DB" -n "$CA_NAME" -a | grep -v CERTIFICATE)
+  [ -z "$ca_base64" ] && exiterr "Could not encode $CA_NAME certificate."
   uuid1=$(uuidgen)
   [ -z "$uuid1" ] && exiterr "Could not generate UUID value."
   mc_file="$export_dir$client_name.mobileconfig"
@@ -827,6 +908,8 @@ cat > "$mc_file" <<EOF
       <string>Configures VPN settings</string>
       <key>PayloadDisplayName</key>
       <string>VPN</string>
+      <key>PayloadOrganization</key>
+      <string>IKEv2 VPN</string>
       <key>PayloadIdentifier</key>
       <string>com.apple.vpn.managed.$(uuidgen)</string>
       <key>PayloadType</key>
@@ -848,6 +931,14 @@ cat > "$mc_file" <<EOF
       <string>IKEv2</string>
     </dict>
     <dict>
+EOF
+  if [ "$use_config_password" = "0" ]; then
+cat >> "$mc_file" <<EOF
+      <key>Password</key>
+      <string>$p12_password</string>
+EOF
+  fi
+cat >> "$mc_file" <<EOF
       <key>PayloadCertificateFileName</key>
       <string>$client_name</string>
       <key>PayloadContent</key>
@@ -889,7 +980,7 @@ $ca_base64
     </dict>
   </array>
   <key>PayloadDisplayName</key>
-  <string>IKEv2 VPN ($server_addr)</string>
+  <string>IKEv2 VPN $server_addr</string>
   <key>PayloadIdentifier</key>
   <string>com.apple.vpn.managed.$(uuidgen)</string>
   <key>PayloadRemovalDisallowed</key>
@@ -919,7 +1010,7 @@ create_android_profile() {
 cat > "$sswan_file" <<EOF
 {
   "uuid": "$uuid2",
-  "name": "IKEv2 VPN ($server_addr)",
+  "name": "IKEv2 VPN $server_addr",
   "type": "ikev2-cert",
   "remote": {
     "addr": "$server_addr"
@@ -941,6 +1032,8 @@ EOF
 export_client_config() {
   if [ "$os_type" != "alpine" ]; then
     install_base64_uuidgen
+  else
+    install_uuidgen
   fi
   export_p12_file
   create_mobileconfig
@@ -950,10 +1043,10 @@ export_client_config() {
 create_ca_server_certs() {
   bigecho2 "Generating CA and server certificates..."
   certutil -z <(head -c 1024 /dev/urandom) \
-    -S -x -n "IKEv2 VPN CA" \
-    -s "O=IKEv2 VPN,CN=IKEv2 VPN CA" \
+    -S -x -n "$CA_NAME" \
+    -s "O=IKEv2 VPN,CN=$CA_NAME" \
     -k rsa -g 3072 -v 120 \
-    -d sql:/etc/ipsec.d -t "CT,," -2 >/dev/null 2>&1 <<ANSWERS || exiterr "Failed to create CA certificate."
+    -d "$CERT_DB" -t "CT,," -2 >/dev/null 2>&1 <<ANSWERS || exiterr "Failed to create CA certificate."
 y
 
 N
@@ -961,32 +1054,48 @@ ANSWERS
   sleep 1
   if [ "$use_dns_name" = "1" ]; then
     certutil -z <(head -c 1024 /dev/urandom) \
-      -S -c "IKEv2 VPN CA" -n "$server_addr" \
+      -S -c "$CA_NAME" -n "$server_addr" \
       -s "O=IKEv2 VPN,CN=$server_addr" \
       -k rsa -g 3072 -v 120 \
-      -d sql:/etc/ipsec.d -t ",," \
+      -d "$CERT_DB" -t ",," \
       --keyUsage digitalSignature,keyEncipherment \
       --extKeyUsage serverAuth \
       --extSAN "dns:$server_addr" >/dev/null 2>&1 || exiterr "Failed to create server certificate."
   else
     certutil -z <(head -c 1024 /dev/urandom) \
-      -S -c "IKEv2 VPN CA" -n "$server_addr" \
+      -S -c "$CA_NAME" -n "$server_addr" \
       -s "O=IKEv2 VPN,CN=$server_addr" \
       -k rsa -g 3072 -v 120 \
-      -d sql:/etc/ipsec.d -t ",," \
+      -d "$CERT_DB" -t ",," \
       --keyUsage digitalSignature,keyEncipherment \
       --extKeyUsage serverAuth \
       --extSAN "ip:$server_addr,dns:$server_addr" >/dev/null 2>&1 || exiterr "Failed to create server certificate."
   fi
 }
 
+create_config_readme() {
+  readme_file="$export_dir$client_name-README.txt"
+  if [ "$in_container" = "0" ] && [ "$use_config_password" = "0" ] \
+    && [ "$use_defaults" = "1" ] && [ ! -t 1 ] && [ ! -f "$readme_file" ]; then
+cat > "$readme_file" <<'EOF'
+These IKEv2 client config files were created during IPsec VPN setup.
+To configure IKEv2 clients, see: https://vpnsetup.net/clients
+EOF
+    if [ "$export_to_home_dir" = "1" ]; then
+      chown "$SUDO_USER:$SUDO_USER" "$readme_file"
+    fi
+    chmod 600 "$readme_file"
+  fi
+}
+
 add_ikev2_connection() {
   bigecho2 "Adding a new IKEv2 connection..."
-  if ! grep -qs '^include /etc/ipsec\.d/\*\.conf$' /etc/ipsec.conf; then
-    echo >> /etc/ipsec.conf
-    echo 'include /etc/ipsec.d/*.conf' >> /etc/ipsec.conf
+  XAUTH_POOL=${VPN_XAUTH_POOL:-'192.168.43.10-192.168.43.250'}
+  if ! grep -qs '^include /etc/ipsec\.d/\*\.conf$' "$IPSEC_CONF"; then
+    echo >> "$IPSEC_CONF"
+    echo 'include /etc/ipsec.d/*.conf' >> "$IPSEC_CONF"
   fi
-cat > /etc/ipsec.d/ikev2.conf <<EOF
+cat > "$IKEV2_CONF" <<EOF
 
 conn ikev2-cp
   left=%defaultroute
@@ -996,12 +1105,12 @@ conn ikev2-cp
   leftrsasigkey=%cert
   right=%any
   rightid=%fromcert
-  rightaddresspool=192.168.43.10-192.168.43.250
+  rightaddresspool=$XAUTH_POOL
   rightca=%same
   rightrsasigkey=%cert
   narrowing=yes
   dpddelay=30
-  dpdtimeout=120
+  retransmit-timeout=300s
   dpdaction=clear
   auto=add
   ikev2=insist
@@ -1014,27 +1123,27 @@ conn ikev2-cp
   encapsulation=yes
 EOF
   if [ "$use_dns_name" = "1" ]; then
-cat >> /etc/ipsec.d/ikev2.conf <<EOF
+cat >> "$IKEV2_CONF" <<EOF
   leftid=@$server_addr
 EOF
   else
-cat >> /etc/ipsec.d/ikev2.conf <<EOF
+cat >> "$IKEV2_CONF" <<EOF
   leftid=$server_addr
 EOF
   fi
   if [ -n "$dns_server_2" ]; then
-cat >> /etc/ipsec.d/ikev2.conf <<EOF
+cat >> "$IKEV2_CONF" <<EOF
   modecfgdns="$dns_servers"
 EOF
   else
-cat >> /etc/ipsec.d/ikev2.conf <<EOF
+cat >> "$IKEV2_CONF" <<EOF
   modecfgdns=$dns_server_1
 EOF
   fi
   if [ "$mobike_enable" = "1" ]; then
-    echo "  mobike=yes" >> /etc/ipsec.d/ikev2.conf
+    echo "  mobike=yes" >> "$IKEV2_CONF"
   else
-    echo "  mobike=no" >> /etc/ipsec.d/ikev2.conf
+    echo "  mobike=no" >> "$IKEV2_CONF"
   fi
 }
 
@@ -1042,27 +1151,26 @@ apply_ubuntu1804_nss_fix() {
   if [ "$os_type" = "ubuntu" ] && [ "$os_ver" = "bustersid" ] && [ "$os_arch" = "x86_64" ]; then
     nss_url1="https://mirrors.kernel.org/ubuntu/pool/main/n/nss"
     nss_url2="https://mirrors.kernel.org/ubuntu/pool/universe/n/nss"
-    nss_deb1="libnss3_3.49.1-1ubuntu1.5_amd64.deb"
-    nss_deb2="libnss3-dev_3.49.1-1ubuntu1.5_amd64.deb"
-    nss_deb3="libnss3-tools_3.49.1-1ubuntu1.5_amd64.deb"
-    TMPDIR=$(mktemp -d /tmp/nss.XXX 2>/dev/null)
-    if [ -d "$TMPDIR" ]; then
+    nss_deb1="libnss3_3.49.1-1ubuntu1.8_amd64.deb"
+    nss_deb2="libnss3-dev_3.49.1-1ubuntu1.8_amd64.deb"
+    nss_deb3="libnss3-tools_3.49.1-1ubuntu1.8_amd64.deb"
+    if tmpdir=$(mktemp --tmpdir -d vpn.XXXXX 2>/dev/null); then
       bigecho2 "Applying fix for NSS bug on Ubuntu 18.04..."
       export DEBIAN_FRONTEND=noninteractive
-      if wget -t 3 -T 30 -q -O "$TMPDIR/1.deb" "$nss_url1/$nss_deb1" \
-        && wget -t 3 -T 30 -q -O "$TMPDIR/2.deb" "$nss_url1/$nss_deb2" \
-        && wget -t 3 -T 30 -q -O "$TMPDIR/3.deb" "$nss_url2/$nss_deb3"; then
-        apt-get -yqq update
-        apt-get -yqq install "$TMPDIR/1.deb" "$TMPDIR/2.deb" "$TMPDIR/3.deb" >/dev/null
+      if wget -t 3 -T 30 -q -O "$tmpdir/1.deb" "$nss_url1/$nss_deb1" \
+        && wget -t 3 -T 30 -q -O "$tmpdir/2.deb" "$nss_url1/$nss_deb2" \
+        && wget -t 3 -T 30 -q -O "$tmpdir/3.deb" "$nss_url2/$nss_deb3"; then
+        apt-get -yqq update || apt-get -yqq update
+        apt-get -yqq install "$tmpdir/1.deb" "$tmpdir/2.deb" "$tmpdir/3.deb" >/dev/null
       fi
-      /bin/rm -f "$TMPDIR/1.deb" "$TMPDIR/2.deb" "$TMPDIR/3.deb"
-      /bin/rmdir "$TMPDIR"
+      /bin/rm -f "$tmpdir/1.deb" "$tmpdir/2.deb" "$tmpdir/3.deb"
+      /bin/rmdir "$tmpdir"
     fi
   fi
 }
 
 restart_ipsec_service() {
-  if [ "$in_container" = "0" ] || { [ "$in_container" = "1" ] && service ipsec status >/dev/null 2>&1; } then
+  if [ "$in_container" = "0" ] || { [ "$in_container" = "1" ] && service ipsec status >/dev/null 2>&1; }; then
     bigecho2 "Restarting IPsec service..."
     mkdir -p /run/pluto
     service ipsec restart 2>/dev/null
@@ -1070,24 +1178,29 @@ restart_ipsec_service() {
 }
 
 create_crl() {
-  if ! crlutil -L -d sql:/etc/ipsec.d -n "IKEv2 VPN CA" >/dev/null 2>&1; then
-    crlutil -G -d sql:/etc/ipsec.d -n "IKEv2 VPN CA" -c /dev/null >/dev/null
+  if ! crlutil -L -d "$CERT_DB" -n "$CA_NAME" >/dev/null 2>&1; then
+    crlutil -G -d "$CERT_DB" -n "$CA_NAME" -c /dev/null >/dev/null
   fi
   sleep 2
 }
 
 add_client_cert_to_crl() {
-  sn_txt=$(certutil -L -d sql:/etc/ipsec.d -n "$client_name" | grep -A 1 'Serial Number' | tail -n 1)
+  sn_txt=$(certutil -L -d "$CERT_DB" -n "$client_name" | grep -A 1 'Serial Number' | tail -n 1)
   sn_hex=$(printf '%s' "$sn_txt" | sed -e 's/^ *//' -e 's/://g')
   sn_dec=$((16#$sn_hex))
   [ -z "$sn_dec" ] && exiterr "Could not find serial number of client certificate."
-crlutil -M -d sql:/etc/ipsec.d -n "IKEv2 VPN CA" >/dev/null <<EOF || exiterr "Failed to add client certificate to CRL."
+crlutil -M -d "$CERT_DB" -n "$CA_NAME" >/dev/null <<EOF || exiterr "Failed to add client certificate to CRL."
 addcert $sn_dec $(date -u +%Y%m%d%H%M%SZ)
 EOF
 }
 
 reload_crls() {
-  ipsec crls || exiterr "Failed to let Libreswan re-read the updated CRL."
+  ipsec crls
+}
+
+delete_client_cert() {
+  certutil -F -d "$CERT_DB" -n "$client_name"
+  certutil -D -d "$CERT_DB" -n "$client_name" 2>/dev/null
 }
 
 print_client_added() {
@@ -1096,7 +1209,7 @@ cat <<EOF
 
 ================================================
 
-New IKEv2 VPN client "$client_name" added!
+New IKEv2 client "$client_name" added!
 
 EOF
   print_server_client_info
@@ -1108,7 +1221,7 @@ cat <<EOF
 
 ================================================
 
-IKEv2 VPN client "$client_name" exported!
+IKEv2 client "$client_name" exported!
 
 EOF
   print_server_client_info
@@ -1118,29 +1231,13 @@ print_client_revoked() {
   echo "Certificate '$client_name' revoked!"
 }
 
-show_swan_update_info() {
-  if printf '%s' "$swan_ver_latest" | grep -Eq '^([3-9]|[1-9][0-9]{1,2})(\.([0-9]|[1-9][0-9]{1,2})){1,2}$' \
-    && [ "$swan_ver" != "$swan_ver_latest" ] \
-    && printf '%s\n%s' "$swan_ver" "$swan_ver_latest" | sort -C -V; then
-    echo
-    echo "Note: A newer version of Libreswan ($swan_ver_latest) is available."
-    if [ "$in_container" = "0" ]; then
-      get_update_url
-      echo "      To update, run:"
-      echo "      wget $update_url -O vpnup.sh && sudo sh vpnup.sh"
-    else
-      echo "      To update this Docker image, see: https://git.io/updatedockervpn"
-    fi
-  fi
+print_client_deleted() {
+  echo "Certificate '$client_name' deleted!"
 }
 
 print_setup_complete() {
-  if [ -n "$VPN_DNS_NAME" ] || [ -n "$VPN_CLIENT_NAME" ] || [ -n "$VPN_DNS_SRV1" ]; then
-    printf '\e[2K\r'
-  else
-    printf '\e[2K\e[1A\e[2K\r'
-    [ "$use_defaults" = "1" ] && printf '\e[1A\e[2K\e[1A\e[2K\e[1A\e[2K\r'
-  fi
+  printf '\e[2K\e[1A\e[2K\r'
+  [ "$use_defaults" = "1" ] && printf '\e[1A\e[2K\e[1A\e[2K\e[1A\e[2K\r'
 cat <<EOF
 ================================================
 
@@ -1165,65 +1262,110 @@ cat <<EOF
 $export_dir$client_name.p12 (for Windows & Linux)
 $export_dir$client_name.sswan (for Android)
 $export_dir$client_name.mobileconfig (for iOS & macOS)
+EOF
+  if [ "$use_config_password" = "1" ]; then
+cat <<EOF
 
 *IMPORTANT* Password for client config files:
 $p12_password
 Write this down, you'll need it for import!
 EOF
+  fi
 cat <<'EOF'
 
-Next steps: Configure IKEv2 VPN clients. See:
-https://git.io/ikev2clients
+Next steps: Configure IKEv2 clients. See:
+https://vpnsetup.net/clients
 
 ================================================
 
 EOF
 }
 
+check_swan_update() {
+  base_url="https://github.com/hwdsl2/vpn-extras/releases/download/v1.0.0"
+  swan_ver_url="$base_url/upg-$os_type-$os_ver-swanver"
+  swan_ver_latest=$(wget -t 3 -T 15 -qO- "$swan_ver_url" | head -n 1)
+  if printf '%s' "$swan_ver_latest" | grep -Eq '^([3-9]|[1-9][0-9]{1,2})(\.([0-9]|[1-9][0-9]{1,2})){1,2}$' \
+    && [ -n "$swan_ver" ] && [ "$swan_ver" != "$swan_ver_latest" ] \
+    && printf '%s\n%s' "$swan_ver" "$swan_ver_latest" | sort -C -V; then
+cat <<EOF
+Note: A newer version of Libreswan ($swan_ver_latest) is available.
+      To update, run:
+      wget https://get.vpnsetup.net/upg -O vpnup.sh && sudo sh vpnup.sh
+
+EOF
+  fi
+}
+
 check_ipsec_conf() {
-  if grep -qs "conn ikev2-cp" /etc/ipsec.conf; then
-    echo "Error: IKEv2 configuration section found in /etc/ipsec.conf." >&2
-    echo "       This script cannot automatically remove IKEv2 from this server." >&2
-    echo "       To manually remove IKEv2, see https://git.io/ikev2" >&2
+  if grep -qs "conn ikev2-cp" "$IPSEC_CONF"; then
+cat 1>&2 <<EOF
+Error: IKEv2 configuration section found in $IPSEC_CONF.
+       This script cannot automatically remove IKEv2 from this server.
+       To manually remove IKEv2, see https://vpnsetup.net/ikev2
+EOF
+    abort_and_exit
+  fi
+  if grep -qs "ikev1-policy=drop" "$IPSEC_CONF" \
+    || grep -qs "ikev1-policy=reject" "$IPSEC_CONF"; then
+cat 1>&2 <<EOF
+Error: IKEv2-only mode is currently enabled on this VPN server.
+       You must first disable IKEv2-only mode before removing IKEv2.
+       Otherwise, you will NOT be able to connect to this VPN server.
+EOF
     abort_and_exit
   fi
 }
 
 confirm_revoke_cert() {
-  echo "WARNING: You have selected to revoke IKEv2 client certificate '$client_name'."
-  echo "         After revocation, this certificate *cannot* be used by VPN client(s)"
-  echo "         to connect to this VPN server."
-  echo
+cat <<EOF
+WARNING: You have selected to revoke IKEv2 client certificate '$client_name'.
+         After revocation, this certificate *cannot* be used by VPN client(s)
+         to connect to this VPN server.
+
+EOF
   confirm_or_abort "Are you sure you want to revoke '$client_name'? [y/N] "
 }
 
+confirm_delete_cert() {
+cat <<EOF
+WARNING: Deleting a client certificate from the IPsec database *WILL NOT* prevent
+         VPN client(s) from connecting using that certificate! For this use case,
+         you *MUST* revoke the client certificate instead of deleting it.
+         This *cannot* be undone!
+
+EOF
+  confirm_or_abort "Are you sure you want to delete '$client_name'? [y/N] "
+}
+
 confirm_remove_ikev2() {
-  echo "WARNING: This option will remove IKEv2 from this VPN server, but keep the IPsec/L2TP"
-  echo "         and IPsec/XAuth (\"Cisco IPsec\") modes, if installed. All IKEv2 configuration"
-  echo "         including certificates and keys will be permanently deleted."
-  echo "         This *cannot* be undone! "
-  echo
+cat <<'EOF'
+WARNING: This option will remove IKEv2 from this VPN server, but keep the IPsec/L2TP
+         and IPsec/XAuth ("Cisco IPsec") modes, if installed. All IKEv2 configuration
+         including certificates and keys will be *permanently deleted*.
+         This *cannot* be undone!
+
+EOF
   confirm_or_abort "Are you sure you want to remove IKEv2? [y/N] "
 }
 
 delete_ikev2_conf() {
-  bigecho "Deleting /etc/ipsec.d/ikev2.conf..."
-  /bin/rm -f /etc/ipsec.d/ikev2.conf
+  bigecho "Deleting $IKEV2_CONF..."
+  /bin/rm -f "$IKEV2_CONF"
 }
 
 delete_certificates() {
   echo
   bigecho "Deleting certificates and keys from the IPsec database..."
-  certutil -L -d sql:/etc/ipsec.d | grep -v -e '^$' -e 'IKEv2 VPN CA' | tail -n +3 | cut -f1 -d ' ' | while read -r line; do
-    certutil -F -d sql:/etc/ipsec.d -n "$line"
-    certutil -D -d sql:/etc/ipsec.d -n "$line" 2>/dev/null
+  certutil -L -d "$CERT_DB" | grep -v -e '^$' -e "$CA_NAME" | tail -n +3 | cut -f1 -d ' ' | while read -r line; do
+    certutil -F -d "$CERT_DB" -n "$line"
+    certutil -D -d "$CERT_DB" -n "$line" 2>/dev/null
   done
-  crlutil -D -d sql:/etc/ipsec.d -n "IKEv2 VPN CA" 2>/dev/null
-  certutil -F -d sql:/etc/ipsec.d -n "IKEv2 VPN CA"
-  certutil -D -d sql:/etc/ipsec.d -n "IKEv2 VPN CA" 2>/dev/null
-  config_file="/etc/ipsec.d/.vpnconfig"
-  if grep -qs '^IKEV2_CONFIG_PASSWORD=.\+' "$config_file"; then
-    sed -i '/IKEV2_CONFIG_PASSWORD=/d' "$config_file"
+  crlutil -D -d "$CERT_DB" -n "$CA_NAME" 2>/dev/null
+  certutil -F -d "$CERT_DB" -n "$CA_NAME"
+  certutil -D -d "$CERT_DB" -n "$CA_NAME" 2>/dev/null
+  if grep -qs '^IKEV2_CONFIG_PASSWORD=.\+' "$CONF_FILE"; then
+    sed -i '/IKEV2_CONFIG_PASSWORD=/d' "$CONF_FILE"
   fi
 }
 
@@ -1233,10 +1375,11 @@ print_ikev2_removed() {
 }
 
 ikev2setup() {
-  check_run_as_root
+  check_root
   check_container
-  check_os_type
-  check_swan_install
+  check_os
+  check_libreswan
+  check_swan_ver
   check_utils_exist
 
   use_defaults=0
@@ -1244,6 +1387,7 @@ ikev2setup() {
   export_client=0
   list_clients=0
   revoke_client=0
+  delete_client=0
   remove_ikev2=0
   while [ "$#" -gt 0 ]; do
     case $1 in
@@ -1273,6 +1417,12 @@ ikev2setup() {
         shift
         shift
         ;;
+      --deleteclient)
+        delete_client=1
+        client_name="$2"
+        shift
+        shift
+        ;;
       --removeikev2)
         remove_ikev2=1
         shift
@@ -1286,7 +1436,15 @@ ikev2setup() {
     esac
   done
 
+  CA_NAME="IKEv2 VPN CA"
+  CERT_DB="sql:/etc/ipsec.d"
+  CONF_DIR="/etc/ipsec.d"
+  CONF_FILE="/etc/ipsec.d/.vpnconfig"
+  IKEV2_CONF="/etc/ipsec.d/ikev2.conf"
+  IPSEC_CONF="/etc/ipsec.conf"
+
   check_arguments
+  check_config_password
   get_export_dir
 
   if [ "$add_client" = "1" ]; then
@@ -1312,6 +1470,7 @@ ikev2setup() {
   if [ "$list_clients" = "1" ]; then
     show_header
     list_existing_clients
+    echo
     exit 0
   fi
 
@@ -1322,6 +1481,14 @@ ikev2setup() {
     add_client_cert_to_crl
     reload_crls
     print_client_revoked
+    exit 0
+  fi
+
+  if [ "$delete_client" = "1" ]; then
+    show_header
+    confirm_delete_cert
+    delete_client_cert
+    print_client_deleted
     exit 0
   fi
 
@@ -1346,7 +1513,7 @@ ikev2setup() {
     case $selected_option in
       1)
         enter_client_name
-        enter_client_cert_validity
+        enter_client_validity
         echo
         create_client_cert
         export_client_config
@@ -1365,6 +1532,7 @@ ikev2setup() {
       3)
         echo
         list_existing_clients
+        echo
         exit 0
         ;;
       4)
@@ -1378,6 +1546,14 @@ ikev2setup() {
         exit 0
         ;;
       5)
+        enter_client_name_for delete
+        echo
+        confirm_delete_cert
+        delete_client_cert
+        print_client_deleted
+        exit 0
+        ;;
+      6)
         check_ipsec_conf
         echo
         confirm_remove_ikev2
@@ -1397,58 +1573,29 @@ ikev2setup() {
     esac
   fi
 
-  check_cert_exists_and_exit "IKEv2 VPN CA"
-  check_swan_ver
+  check_cert_exists_and_exit "$CA_NAME"
 
   if [ "$use_defaults" = "0" ]; then
-    select_swan_update
     show_header
     show_welcome
     enter_server_address
     check_cert_exists_and_exit "$server_addr"
-    enter_client_name_with_defaults
-    enter_client_cert_validity
+    enter_client_name with_defaults
+    enter_client_validity
     enter_custom_dns
     check_mobike_support
     select_mobike
+    select_config_password
     confirm_setup_options
   else
     check_server_dns_name
     check_custom_dns
-    if [ -n "$VPN_CLIENT_NAME" ]; then
-      client_name="$VPN_CLIENT_NAME"
-      check_client_name "$client_name" \
-        || exiterr "Invalid client name. Use one word only, no special characters except '-' and '_'."
-    else
-      client_name=vpnclient
-    fi
-    check_cert_exists "$client_name" && exiterr "Client '$client_name' already exists."
+    check_and_set_client_name
     client_validity=120
     show_header
     show_start_setup
-    if [ -n "$VPN_DNS_NAME" ]; then
-      use_dns_name=1
-      server_addr="$VPN_DNS_NAME"
-    else
-      use_dns_name=0
-      get_server_ip
-      check_ip "$public_ip" || exiterr "Cannot detect this server's public IP."
-      server_addr="$public_ip"
-    fi
-    check_cert_exists_and_exit "$server_addr"
-    if [ -n "$VPN_DNS_SRV1" ] && [ -n "$VPN_DNS_SRV2" ]; then
-      dns_server_1="$VPN_DNS_SRV1"
-      dns_server_2="$VPN_DNS_SRV2"
-      dns_servers="$VPN_DNS_SRV1 $VPN_DNS_SRV2"
-    elif [ -n "$VPN_DNS_SRV1" ]; then
-      dns_server_1="$VPN_DNS_SRV1"
-      dns_server_2=""
-      dns_servers="$VPN_DNS_SRV1"
-    else
-      dns_server_1=8.8.8.8
-      dns_server_2=8.8.4.4
-      dns_servers="8.8.8.8 8.8.4.4"
-    fi
+    set_server_address
+    set_dns_servers
     check_mobike_support
     mobike_enable="$mobike_support"
   fi
@@ -1457,19 +1604,18 @@ ikev2setup() {
   create_ca_server_certs
   create_client_cert
   export_client_config
+  create_config_readme
   add_ikev2_connection
   if [ "$os_type" = "alpine" ]; then
     ipsec auto --add ikev2-cp >/dev/null
   else
     restart_ipsec_service
   fi
-
-  if [ "$use_defaults" = "1" ]; then
-    show_swan_update_info
-  fi
-
   print_setup_complete
   print_client_info
+  if [ "$in_container" = "0" ]; then
+    check_swan_update
+  fi
 }
 
 ## Defer setup until we have the complete script

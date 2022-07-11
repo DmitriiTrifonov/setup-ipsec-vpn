@@ -1,11 +1,11 @@
 #!/bin/bash
 #
-# Script to update Libreswan on Amazon Linux 2
+# Script to update Libreswan on Alpine Linux
 #
 # The latest version of this script is available at:
 # https://github.com/hwdsl2/setup-ipsec-vpn
 #
-# Copyright (C) 2020-2022 Lin Song <linsongui@gmail.com>
+# Copyright (C) 2021-2022 Lin Song <linsongui@gmail.com>
 #
 # This work is licensed under the Creative Commons Attribution-ShareAlike 3.0
 # Unported License: http://creativecommons.org/licenses/by-sa/3.0/
@@ -24,7 +24,7 @@ SYS_DT=$(date +%F-%T | tr ':' '_')
 [ -n "$VPN_UPDATE_SWAN_VER" ] && SWAN_VER="$VPN_UPDATE_SWAN_VER"
 
 exiterr()  { echo "Error: $1" >&2; exit 1; }
-exiterr2() { exiterr "'yum install' failed."; }
+exiterr2() { exiterr "'apk add' failed."; }
 bigecho() { echo "## $1"; }
 
 check_root() {
@@ -33,9 +33,26 @@ check_root() {
   fi
 }
 
+check_vz() {
+  if [ -f /proc/user_beancounters ]; then
+    exiterr "OpenVZ VPS is not supported."
+  fi
+}
+
 check_os() {
-  if ! grep -qs "Amazon Linux release 2" /etc/system-release; then
-    exiterr "This script only supports Amazon Linux 2."
+  os_type=$(lsb_release -si 2>/dev/null)
+  [ -z "$os_type" ] && [ -f /etc/os-release ] && os_type=$(. /etc/os-release && printf '%s' "$ID")
+  case $os_type in
+    [Aa]lpine)
+      os_type=alpine
+      ;;
+    *)
+      exiterr "This script only supports Alpine Linux."
+      ;;
+  esac
+  os_ver=$(. /etc/os-release && printf '%s' "$VERSION_ID" | cut -d '.' -f 1,2)
+  if [ "$os_ver" != "3.15" ] && [ "$os_ver" != "3.16" ]; then
+    exiterr "This script only supports Alpine Linux 3.15/3.16."
   fi
 }
 
@@ -54,7 +71,7 @@ EOF
 get_swan_ver() {
   swan_ver_cur=4.7
   base_url="https://github.com/hwdsl2/vpn-extras/releases/download/v1.0.0"
-  swan_ver_url="$base_url/upg-v1-amzn-2-swanver"
+  swan_ver_url="$base_url/upg-v1-$os_type-$os_ver-swanver"
   swan_ver_latest=$(wget -t 3 -T 15 -qO- "$swan_ver_url" | head -n 1)
   if printf '%s' "$swan_ver_latest" | grep -Eq '^([3-9]|[1-9][0-9]{1,2})(\.([0-9]|[1-9][0-9]{1,2})){1,2}$'; then
     swan_ver_cur="$swan_ver_latest"
@@ -63,13 +80,12 @@ get_swan_ver() {
 }
 
 check_swan_ver() {
-  if [ "$SWAN_VER" != "3.32" ] \
-    && { ! printf '%s\n%s' "4.1" "$SWAN_VER" | sort -C -V \
-    || ! printf '%s\n%s' "$SWAN_VER" "$swan_ver_cur" | sort -C -V; }; then
+  if ! printf '%s\n%s' "4.5" "$SWAN_VER" | sort -C -V \
+    || ! printf '%s\n%s' "$SWAN_VER" "$swan_ver_cur" | sort -C -V; then
 cat 1>&2 <<EOF
 Error: Libreswan version '$SWAN_VER' is not supported.
        This script can install one of these versions:
-       3.32, 4.1-$swan_ver_cur
+       4.5-$swan_ver_cur
 EOF
     exit 1
   fi
@@ -127,10 +143,10 @@ install_pkgs() {
   bigecho "Installing required packages..."
   (
     set -x
-    yum -y -q install nss-devel nspr-devel pkgconfig pam-devel \
-      libcap-ng-devel libselinux-devel curl-devel nss-tools \
-      flex bison gcc make wget sed tar \
-      systemd-devel libevent-devel fipscheck-devel >/dev/null
+    apk add -U -q bash bind-tools coreutils openssl wget iproute2 sed grep \
+    libcap-ng libcurl libevent linux-pam musl nspr nss nss-tools \
+    bison flex gcc make libc-dev bsd-compat-headers linux-pam-dev nss-dev \
+    libcap-ng-dev libevent-dev curl-dev nspr-dev uuidgen openrc
   ) || exiterr2
 }
 
@@ -151,20 +167,16 @@ get_libreswan() {
 install_libreswan() {
   bigecho "Compiling and installing Libreswan, please wait..."
   cd "libreswan-$SWAN_VER" || exit 1
+  sed -i '1c\#!/sbin/openrc-run' /etc/init.d/ipsec
   service ipsec stop >/dev/null 2>&1
-  [ "$SWAN_VER" = "4.1" ] && sed -i 's/ sysv )/ sysvinit )/' programs/setup/setup.in
+  sed -i '28s/stdlib\.h/sys\/types.h/' include/fd.h
 cat > Makefile.inc.local <<'EOF'
 WERROR_CFLAGS=-w -s
 USE_DNSSEC=false
+USE_DH2=true
+FINALNSSDIR=/etc/ipsec.d
+USE_GLIBC_KERN_FLIP_HEADERS=true
 EOF
-  echo "USE_DH2=true" >> Makefile.inc.local
-  if ! grep -qs IFLA_XFRM_LINK /usr/include/linux/if_link.h; then
-    echo "USE_XFRM_INTERFACE_IFLA_HEADER=true" >> Makefile.inc.local
-  fi
-  if [ "$SWAN_VER" != "3.32" ]; then
-    echo "USE_NSS_KDF=false" >> Makefile.inc.local
-    echo "FINALNSSDIR=/etc/ipsec.d" >> Makefile.inc.local
-  fi
   NPROCS=$(grep -c ^processor /proc/cpuinfo)
   [ -z "$NPROCS" ] && NPROCS=1
   (
@@ -177,12 +189,6 @@ EOF
     service ipsec start >/dev/null 2>&1
     exiterr "Libreswan $SWAN_VER failed to build."
   fi
-}
-
-restore_selinux() {
-  restorecon /etc/ipsec.d/*db 2>/dev/null
-  restorecon /usr/local/sbin -Rv 2>/dev/null
-  restorecon /usr/local/libexec/ipsec -Rv 2>/dev/null
 }
 
 update_ikev2_script() {
@@ -205,6 +211,11 @@ update_config() {
   bigecho "Updating VPN configuration..."
   IKE_NEW="  ike=aes256-sha2,aes128-sha2,aes256-sha1,aes128-sha1,aes256-sha2;modp1024,aes128-sha1;modp1024"
   PHASE2_NEW="  phase2alg=aes_gcm-null,aes128-sha1,aes256-sha1,aes256-sha2_512,aes128-sha2,aes256-sha2"
+  if uname -m | grep -qi '^arm'; then
+    if ! modprobe -q sha512; then
+      PHASE2_NEW="  phase2alg=aes_gcm-null,aes128-sha1,aes256-sha1,aes128-sha2,aes256-sha2"
+    fi
+  fi
   dns_state=0
   DNS_SRV1=$(grep "modecfgdns1=" /etc/ipsec.conf | head -n 1 | cut -d '=' -f 2)
   DNS_SRV2=$(grep "modecfgdns2=" /etc/ipsec.conf | head -n 1 | cut -d '=' -f 2)
@@ -235,7 +246,8 @@ update_config() {
 restart_ipsec() {
   bigecho "Restarting IPsec service..."
   mkdir -p /run/pluto
-  service ipsec restart 2>/dev/null
+  sed -i '1c\#!/sbin/openrc-run' /etc/init.d/ipsec
+  service ipsec restart >/dev/null 2>&1
 }
 
 show_setup_complete() {
@@ -264,6 +276,7 @@ EOF
 
 vpnupgrade() {
   check_root
+  check_vz
   check_os
   check_libreswan
   get_swan_ver
@@ -273,7 +286,6 @@ vpnupgrade() {
   install_pkgs
   get_libreswan
   install_libreswan
-  restore_selinux
   update_ikev2_script
   update_config
   restart_ipsec
